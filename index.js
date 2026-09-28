@@ -1,11 +1,28 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
+import mongoose from 'mongoose';
 
 const app = express();
 app.use(express.json());
 
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/urlshortener';
+
+mongoose
+  .connect(MONGO_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch((err) => console.error('MongoDB connection error:', err));
+
+const urlSchema = new mongoose.Schema({
+  originalUrl: { type: String, required: true },
+  shortCode: { type: String, required: true, unique: true, index: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
+const Url = mongoose.model('Url', urlSchema);
+
 const BASE62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
 function generateBase62Code(length = 7) {
   const bytes = crypto.randomBytes(length);
   let code = '';
@@ -15,10 +32,7 @@ function generateBase62Code(length = 7) {
   return code;
 }
 
-// In-memory URL store
-const urls = {};
-
-// Rate Limiter for URL creation (10 requests per 15 mins)
+// 4. Rate Limiter
 const createLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -32,36 +46,50 @@ app.get('/', (req, res) => {
   res.json({ message: 'URL Shortener API is running' });
 });
 
-
-// POST Endpoint -> Create Short URL 
-app.post('/api/shorten', createLimiter, (req, res) => {
+// POST Endpoint -> Save to MongoDB
+app.post('/api/shorten', createLimiter, async (req, res) => {
   const { url } = req.body;
 
   if (!url) {
     return res.status(400).json({ error: 'URL is required' });
   }
 
-  const shortCode = generateBase62Code(7);
-  urls[shortCode] = url;
+  try {
+    const shortCode = generateBase62Code(7);
 
-  res.status(201).json({
-    shortCode,
-    shortUrl: `http://localhost:3000/${shortCode}`,
-    originalUrl: url,
-  });
+    // Save document to MongoDB
+    const newUrl = await Url.create({
+      originalUrl: url,
+      shortCode,
+    });
+
+    res.status(201).json({
+      shortCode: newUrl.shortCode,
+      shortUrl: `http://localhost:3000/${newUrl.shortCode}`,
+      originalUrl: newUrl.originalUrl,
+    });
+  } catch (error) {
+    console.error('Save error:', error);
+    res.status(500).json({ error: 'Failed to create short URL' });
+  }
 });
 
-
-// GET Endpoint -> Redirect
-app.get('/:shortCode', (req, res) => {
+// GET Endpoint -> Fetch from MongoDB
+app.get('/:shortCode', async (req, res) => {
   const { shortCode } = req.params;
-  const originalUrl = urls[shortCode];
 
-  if (!originalUrl) {
-    return res.status(404).json({ error: 'Short URL not found' });
+  try {
+    const urlDoc = await Url.findOne({ shortCode });
+
+    if (!urlDoc) {
+      return res.status(404).json({ error: 'Short URL not found' });
+    }
+
+    return res.redirect(302, urlDoc.originalUrl);
+  } catch (error) {
+    console.error('Fetch error:', error);
+    res.status(500).json({ error: 'Server error looking up URL' });
   }
-
-  return res.redirect(302, originalUrl);
 });
 
 app.listen(3000, () => {
