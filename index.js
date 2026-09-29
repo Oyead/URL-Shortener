@@ -2,19 +2,40 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
 import mongoose from 'mongoose';
+import { createClient } from 'redis';
 
 const app = express();
 app.use(express.json());
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/urlshortener';
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS || '86400', 10); // 24h
 
 mongoose
   .connect(MONGO_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch((err) => console.error('MongoDB connection error:', err));
 
+// Redis is a cache, not a hard dependency: if it never connects the app still
+// serves requests straight from MongoDB. The 'error' listener is mandatory --
+// node-redis rethrows unhandled error events and kills the process without it.
+const redis = createClient({
+  url: REDIS_URL,
+  // Fail fast instead of queueing: without this, commands issued while Redis
+  // is unreachable return a promise that never settles and requests hang.
+  disableOfflineQueue: true,
+});
+
+redis.on('error', (err) => console.error('Redis error:', err.message));
+
+redis
+  .connect()
+  .then(() => console.log('Connected to Redis'))
+  .catch((err) => console.error('Redis connection error:', err.message));
+
 const urlSchema = new mongoose.Schema({
-  originalUrl: { type: String, required: true },
+  // Indexed so the dedupe lookup in POST /api/shorten is not a full scan.
+  originalUrl: { type: String, required: true, index: true },
   shortCode: { type: String, required: true, unique: true, index: true },
   createdAt: { type: Date, default: Date.now },
 });
@@ -30,6 +51,33 @@ function generateBase62Code(length = 7) {
     code += BASE62[bytes[i] % 62];
   }
   return code;
+}
+
+// Cache helpers
+// Every helper swallows Redis failures so a cache outage degrades to MongoDB
+// instead of returning 500. Reads fall back to a miss, writes become no-ops.
+const codeKey = (shortCode) => `code:${shortCode}`;
+
+// Hash the URL so long query strings don't bloat the keyspace.
+const urlKey = (originalUrl) =>
+  `url:${crypto.createHash('sha256').update(originalUrl).digest('hex')}`;
+
+async function cacheGet(key) {
+  if (!redis.isReady) return null;
+  try {
+    return await redis.get(key);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function cacheSet(key, value) {
+  if (!redis.isReady) return;
+  try {
+    await redis.set(key, value, { EX: CACHE_TTL_SECONDS });
+  } catch (err) {
+    // Caching is best-effort.
+  }
 }
 
 // 4. Rate Limiter
@@ -69,7 +117,6 @@ app.post('/api/shorten', createLimiter, async (req, res) => {
       originalUrl: newUrl.originalUrl,
     });
   } catch (error) {
-    console.error('Save error:', error);
     res.status(500).json({ error: 'Failed to create short URL' });
   }
 });
@@ -87,7 +134,6 @@ app.get('/:shortCode', async (req, res) => {
 
     return res.redirect(302, urlDoc.originalUrl);
   } catch (error) {
-    console.error('Fetch error:', error);
     res.status(500).json({ error: 'Server error looking up URL' });
   }
 });
