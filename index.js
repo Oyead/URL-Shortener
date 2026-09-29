@@ -94,7 +94,7 @@ app.get('/', (req, res) => {
   res.json({ message: 'URL Shortener API is running' });
 });
 
-// POST Endpoint -> Save to MongoDB
+// POST Endpoint -> Dedupe via Redis, fall back to MongoDB
 app.post('/api/shorten', createLimiter, async (req, res) => {
   const { url } = req.body;
 
@@ -103,6 +103,32 @@ app.post('/api/shorten', createLimiter, async (req, res) => {
   }
 
   try {
+    // Dedupe: a cached mapping short-circuits before touching MongoDB.
+    const cachedCode = await cacheGet(urlKey(url));
+    if (cachedCode) {
+      return res.status(200).json({
+        shortCode: cachedCode,
+        shortUrl: `http://localhost:3000/${cachedCode}`,
+        originalUrl: url,
+        deduplicated: true,
+      });
+    }
+
+    // Cache miss -- MongoDB is the source of truth, so check for an existing
+    // mapping before creating a duplicate.
+    const existing = await Url.findOne({ originalUrl: url });
+    if (existing) {
+      await cacheSet(urlKey(url), existing.shortCode);
+      await cacheSet(codeKey(existing.shortCode), existing.originalUrl);
+
+      return res.status(200).json({
+        shortCode: existing.shortCode,
+        shortUrl: `http://localhost:3000/${existing.shortCode}`,
+        originalUrl: existing.originalUrl,
+        deduplicated: true,
+      });
+    }
+
     const shortCode = generateBase62Code(7);
 
     // Save document to MongoDB
@@ -111,29 +137,46 @@ app.post('/api/shorten', createLimiter, async (req, res) => {
       shortCode,
     });
 
-    res.status(201).json({
+    // Write-through: warm both directions so the first redirect is a cache hit.
+    await cacheSet(urlKey(url), newUrl.shortCode);
+    await cacheSet(codeKey(newUrl.shortCode), newUrl.originalUrl);
+
+    return res.status(201).json({
       shortCode: newUrl.shortCode,
       shortUrl: `http://localhost:3000/${newUrl.shortCode}`,
       originalUrl: newUrl.originalUrl,
+      deduplicated: false,
     });
   } catch (error) {
+    console.error('Save error:', error);
     res.status(500).json({ error: 'Failed to create short URL' });
   }
 });
 
-// GET Endpoint -> Fetch from MongoDB
+// GET Endpoint -> Read-through Redis cache, fall back to MongoDB
 app.get('/:shortCode', async (req, res) => {
   const { shortCode } = req.params;
 
   try {
+    // Read-through cache: hot redirects never reach MongoDB.
+    const cachedUrl = await cacheGet(codeKey(shortCode));
+    if (cachedUrl) {
+      return res.redirect(302, cachedUrl);
+    }
+
     const urlDoc = await Url.findOne({ shortCode });
 
     if (!urlDoc) {
       return res.status(404).json({ error: 'Short URL not found' });
     }
 
+    await cacheSet(codeKey(shortCode), urlDoc.originalUrl);
+    // Repair the reverse mapping too, so a later POST can dedupe against it.
+    await cacheSet(urlKey(urlDoc.originalUrl), urlDoc.shortCode);
+
     return res.redirect(302, urlDoc.originalUrl);
   } catch (error) {
+    console.error('Fetch error:', error);
     res.status(500).json({ error: 'Server error looking up URL' });
   }
 });
