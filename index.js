@@ -10,6 +10,7 @@ app.use(express.json());
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/urlshortener';
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS || '86400', 10);
+const CLICKS_SYNC_INTERVAL_MS = parseInt(process.env.CLICKS_SYNC_INTERVAL_MS || '10000', 10);
 
 mongoose
   .connect(MONGO_URI)
@@ -31,6 +32,7 @@ redis
 const urlSchema = new mongoose.Schema({
   originalUrl: { type: String, required: true, index: true },
   shortCode: { type: String, required: true, unique: true, index: true },
+  clicks: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
 });
 
@@ -78,6 +80,53 @@ async function cacheSet(key, value) {
     await redis.set(key, value, { EX: CACHE_TTL_SECONDS });
   } catch (err) {}
 }
+
+const clicksKey = (shortCode) => `clicks:${shortCode}`;
+
+function incrementClicksInMongo(shortCode) {
+  Url.updateOne({ shortCode }, { $inc: { clicks: 1 } }).catch(() => {});
+}
+
+async function recordClick(shortCode) {
+  if (!redis.isReady) {
+    incrementClicksInMongo(shortCode);
+    return;
+  }
+  try {
+    await redis.incr(clicksKey(shortCode));
+  } catch (err) {
+    incrementClicksInMongo(shortCode);
+  }
+}
+
+async function drainClickCounters() {
+  if (!redis.isReady) return;
+
+  let cursor = '0';
+
+  try {
+    do {
+      const reply = await redis.scan(cursor, { MATCH: 'clicks:*', COUNT: 100 });
+      cursor = String(reply.cursor);
+
+      for (const key of reply.keys) {
+        const drained = await redis.getDel(key);
+        if (!drained) continue;
+
+        const count = Number.parseInt(drained, 10);
+        if (!Number.isFinite(count) || count <= 0) continue;
+
+        const shortCode = key.slice('clicks:'.length);
+        await Url.updateOne({ shortCode }, { $inc: { clicks: count } });
+      }
+    } while (cursor !== '0');
+  } catch (err) {
+    console.error('Click sync error:', err.message);
+  }
+}
+
+const clicksSyncTimer = setInterval(drainClickCounters, CLICKS_SYNC_INTERVAL_MS);
+clicksSyncTimer.unref();
 
 const createLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -148,10 +197,37 @@ app.post('/api/shorten', createLimiter, async (req, res) => {
   }
 });
 
+app.get('/api/stats/:shortCode', async (req, res) => {
+  const { shortCode } = req.params;
+
+  try {
+    const urlDoc = await Url.findOne({ shortCode });
+
+    if (!urlDoc) {
+      return res.status(404).json({ error: 'Short URL not found' });
+    }
+
+    const pending = await cacheGet(clicksKey(shortCode));
+
+    return res.json({
+      shortCode: urlDoc.shortCode,
+      originalUrl: urlDoc.originalUrl,
+      clicks: urlDoc.clicks,
+      pendingClicks: pending ? Number.parseInt(pending, 10) : 0,
+      createdAt: urlDoc.createdAt,
+    });
+  } catch (error) {
+    console.error('Stats error:', error);
+    return res.status(500).json({ error: 'Server error fetching stats' });
+  }
+});
+
 app.get('/:shortCode', async (req, res) => {
   const { shortCode } = req.params;
 
   try {
+    recordClick(shortCode);
+
     const cachedUrl = await cacheGet(codeKey(shortCode));
     if (cachedUrl) {
       return res.redirect(302, cachedUrl);
