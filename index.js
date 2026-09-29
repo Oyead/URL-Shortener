@@ -47,6 +47,17 @@ function generateBase62Code(length = 7) {
   return code;
 }
 
+function isValidHttpUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048) return false;
+
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 const codeKey = (shortCode) => `code:${shortCode}`;
 
 const urlKey = (originalUrl) =>
@@ -85,6 +96,10 @@ app.post('/api/shorten', createLimiter, async (req, res) => {
 
   if (!url) {
     return res.status(400).json({ error: 'URL is required' });
+  }
+
+  if (!isValidHttpUrl(url)) {
+    return res.status(400).json({ error: 'URL must be a valid http or https URL' });
   }
 
   try {
